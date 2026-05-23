@@ -1,14 +1,18 @@
 from typing import List
 
 
-def read_supplier_orders(cursor) -> List[dict]:
-    """Retorna cabeçalhos dos pedidos da plataforma salvos."""
-    cursor.execute("""
+def read_supplier_orders(cursor, type_of_load: int = None) -> List[dict]:
+    """Retorna cabeçalhos dos pedidos da plataforma salvos.
+    type_of_load: 0=gelado, 1=seco, None=todos.
+    """
+    where = "" if type_of_load is None else "WHERE so.type_of_load = %(tol)s"
+    cursor.execute(f"""
         SELECT
             so.id,
             so.platform_order_id,
             so.vhsys,
             so.platform_status,
+            so.type_of_load,
             so.total,
             so.product_invoice_value,
             so.product_invoice_doc,
@@ -24,11 +28,12 @@ def read_supplier_orders(cursor) -> List[dict]:
                      THEN 1 ELSE 0 END)                     AS unmapped_items
         FROM SUPPLIER_ORDER so
         LEFT JOIN SUPPLIER_ORDER_ITEM soi ON soi.order_id = so.id
+        {where}
         GROUP BY so.id, so.platform_order_id, so.vhsys, so.platform_status,
-                 so.total, so.product_invoice_value, so.product_invoice_doc,
+                 so.type_of_load, so.total, so.product_invoice_value, so.product_invoice_doc,
                  so.service_invoice_value, so.service_invoice_doc, so.loaded_at
         ORDER BY MIN(soi.created_at) DESC NULLS LAST, so.loaded_at DESC
-    """)
+    """, {'tol': type_of_load})
     return cursor.fetchall()
 
 
@@ -62,13 +67,15 @@ def read_item_frequency(cursor, start_date, end_date) -> List[dict]:
         SELECT
             COALESCE(p.description, soi.external_product_name) AS product_desc,
             soi.external_category,
+            so.type_of_load,
             COUNT(DISTINCT soi.order_id)                            AS num_pedidos,
             SUM(soi.quantity)                                       AS qty_total,
             ROUND(SUM(soi.quantity) / COUNT(DISTINCT soi.order_id)::numeric, 2) AS qty_media
         FROM SUPPLIER_ORDER_ITEM soi
+        JOIN  SUPPLIER_ORDER so ON so.id = soi.order_id
         LEFT JOIN PRODUCT p ON p.id = soi.local_product_id
         WHERE soi.created_at::date BETWEEN %(start)s AND %(end)s
-        GROUP BY COALESCE(p.description, soi.external_product_name), soi.external_category
+        GROUP BY COALESCE(p.description, soi.external_product_name), soi.external_category, so.type_of_load
         ORDER BY num_pedidos DESC, qty_total DESC
     """, {'start': start_date, 'end': end_date})
     return cursor.fetchall()
@@ -90,6 +97,7 @@ def read_items_for_price_avg(cursor, start_date, end_date) -> List[dict]:
         SELECT
             COALESCE(p.description, soi.external_product_name) AS product_desc,
             soi.external_category,
+            so.type_of_load,
             soi.quantity,
             soi.price_unit,
             soi.created_at,

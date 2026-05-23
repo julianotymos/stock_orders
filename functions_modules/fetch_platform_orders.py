@@ -41,15 +41,17 @@ def fetch_platform_orders(page: int = 1, size: int = 30, type_of_load: int = 0,
     return resp.json()
 
 
-def fetch_all_platform_orders(max_pages: int = 10) -> List[Dict]:
+def fetch_all_platform_orders(max_pages: int = 10,
+                              type_of_load: int = 0) -> List[Dict]:
     """
     Busca todas as páginas de pedidos até max_pages.
+    type_of_load: 0 = gelado, 1 = seco.
     Faz login uma única vez e reutiliza o token em todas as páginas.
     """
     token = _get_token()
     all_orders = []
     for page in range(1, max_pages + 1):
-        data = fetch_platform_orders(page=page, size=50, token=token)
+        data = fetch_platform_orders(page=page, size=50, type_of_load=type_of_load, token=token)
         content = data.get("content", [])
         if not content:
             break

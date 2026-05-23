@@ -38,6 +38,7 @@ try:
             )
         """)
         _cur.execute("ALTER TABLE SUPPLIER_ORDER ADD COLUMN IF NOT EXISTS service_note VARCHAR(100)")
+        _cur.execute("ALTER TABLE SUPPLIER_ORDER ADD COLUMN IF NOT EXISTS type_of_load SMALLINT")
         _cur.execute("ALTER TABLE SUPPLIER_ORDER ADD COLUMN IF NOT EXISTS vhsys INT")
         _cur.execute("ALTER TABLE SUPPLIER_ORDER ADD COLUMN IF NOT EXISTS product_invoice_value NUMERIC(12,2)")
         _cur.execute("ALTER TABLE SUPPLIER_ORDER ADD COLUMN IF NOT EXISTS product_invoice_doc VARCHAR(30)")
@@ -72,16 +73,31 @@ tab_load, tab_map, tab_orders, tab_avg, tab_freq = st.tabs(["📥 Carregar Pedid
 with tab_load:
     st.subheader("Importar pedidos da plataforma")
 
-    max_pages = st.number_input("Máximo de páginas (50 pedidos/pág)", min_value=1, max_value=20, value=5)
+    col_cfg1, col_cfg2 = st.columns(2)
+    with col_cfg1:
+        max_pages = st.number_input("Máximo de páginas (50 pedidos/pág)", min_value=1, max_value=20, value=5)
+    with col_cfg2:
+        tipo_carga = st.selectbox(
+            "Tipo de pedido",
+            options=[0, 1, -1],
+            format_func=lambda x: {0: "🧊 Gelado", 1: "📦 Seco", -1: "🧊📦 Ambos"}[x],
+        )
 
     col_imp, col_upd = st.columns(2)
+
+    def _fetch_orders_by_tipo(max_pages, tipo_carga):
+        if tipo_carga == -1:
+            orders0 = fetch_all_platform_orders(max_pages=max_pages, type_of_load=0)
+            orders1 = fetch_all_platform_orders(max_pages=max_pages, type_of_load=1)
+            return orders0 + orders1
+        return fetch_all_platform_orders(max_pages=max_pages, type_of_load=tipo_carga)
 
     with col_imp:
         st.caption("Novos pedidos são adicionados. Pedidos já existentes são ignorados.")
         if st.button("📥 Importar novos pedidos", type="primary", use_container_width=True):
             try:
                 with st.spinner("Consultando API da plataforma..."):
-                    orders = fetch_all_platform_orders(max_pages=max_pages)
+                    orders = _fetch_orders_by_tipo(max_pages, tipo_carga)
                 if not orders:
                     st.warning("Nenhum pedido retornado pela API.")
                 else:
@@ -106,7 +122,7 @@ with tab_load:
         if st.button("🔄 Atualizar pedidos existentes", use_container_width=True):
             try:
                 with st.spinner("Consultando API e atualizando..."):
-                    orders = fetch_all_platform_orders(max_pages=max_pages)
+                    orders = _fetch_orders_by_tipo(max_pages, tipo_carga)
                 if not orders:
                     st.warning("Nenhum pedido retornado pela API.")
                 else:
@@ -131,7 +147,7 @@ with tab_load:
     if st.button("👁 Visualizar pedidos da API", use_container_width=True):
         try:
             with st.spinner("Consultando API..."):
-                orders = fetch_all_platform_orders(max_pages=2)
+                orders = _fetch_orders_by_tipo(2, tipo_carga)
             if orders:
                 rows = []
                 for o in orders:
@@ -242,10 +258,21 @@ with tab_map:
 with tab_orders:
     st.subheader("Pedidos importados da plataforma")
 
+    from datetime import date, timedelta
+
+    _tipo_opts = {-1: "Todos", 0: "🧊 Gelado", 1: "📦 Seco"}
+    _tipo_filter = st.selectbox(
+        "Tipo de pedido",
+        options=list(_tipo_opts.keys()),
+        format_func=lambda x: _tipo_opts[x],
+        key="orders_tipo_filter",
+    )
+    _tol_param = None if _tipo_filter == -1 else _tipo_filter
+
     try:
         conn = get_db_connection()
         with conn.cursor() as cursor:
-            orders_saved = [dict(r) for r in read_supplier_orders(cursor)]
+            orders_saved = [dict(r) for r in read_supplier_orders(cursor, type_of_load=_tol_param)]
         conn.close()
     except Exception as e:
         st.error(f"Erro ao carregar pedidos: {e}")
@@ -254,7 +281,6 @@ with tab_orders:
     if not orders_saved:
         st.info("Nenhum pedido importado ainda. Use a aba **Carregar Pedidos**.")
     else:
-        from datetime import date, timedelta
         _df_all = pd.DataFrame(orders_saved)
         _min_date = pd.to_datetime(_df_all['order_date'], errors='coerce').min()
         _min_date = _min_date.date() if pd.notna(_min_date) else date.today() - timedelta(days=365)
@@ -267,6 +293,7 @@ with tab_orders:
         with col_f3:
             filter_pedido = st.text_input("Nº do Pedido", placeholder="Ex: 12345", key="orders_filter_pedido")
 
+
         orders_saved = [
             r for r in orders_saved
             if (r.get('order_date') is None or (filter_start <= r['order_date'].date() <= filter_end))
@@ -277,6 +304,7 @@ with tab_orders:
             1: "Confirmado",
             2: "Em trânsito",
             3: "Finalizado",
+            4: "Cancelado",
             5: "Em estoque",
             7: "Em Separação",
         }
@@ -285,32 +313,33 @@ with tab_orders:
         df_orders['status_desc'] = df_orders['platform_status'].map(STATUS_MAP).fillna(df_orders['platform_status'].astype(str))
         df_orders['alerta'] = df_orders['unmapped_items'].apply(lambda x: f"⚠ {x} sem mapa" if x > 0 else "")
 
-        df_orders['valor_faturado'] = (
-            df_orders['product_invoice_value'].fillna(0) +
-            df_orders['service_invoice_value'].fillna(0)
-        ).replace(0, None)
+        _pnf = pd.to_numeric(df_orders['product_invoice_value'], errors='coerce')
+        _snf = pd.to_numeric(df_orders['service_invoice_value'], errors='coerce')
+        _has_both = _pnf.notna() & _snf.notna()
 
-        _cutoff = pd.Timestamp('2025-06-15')
-        _order_dt = pd.to_datetime(df_orders['order_date'], errors='coerce')
-        _factor = _order_dt.ge(_cutoff).map({True: 0.85 * 0.06, False: 0.06})
+        df_orders['valor_faturado'] = (_pnf + _snf).where(_has_both, other=None)
+
+        _factor = 0.85 * 0.06
         _piv = pd.to_numeric(df_orders['items_value'], errors='coerce')
         _vf  = pd.to_numeric(df_orders['valor_faturado'], errors='coerce')
 
-        _has_vf = _vf.notna()
-        df_orders['dif_icms']      = (_piv * _factor).where(_piv.notna() & _has_vf, other=None)
-        df_orders['frete_imposto'] = (_vf - _piv).where(_has_vf & _piv.notna(), other=None)
+        df_orders['dif_icms']      = (_piv * _factor).where(_piv.notna() & _has_both, other=None)
+        df_orders['frete_imposto'] = (_vf - _piv).where(_has_both & _piv.notna(), other=None)
 
-        _fi_n   = pd.to_numeric(df_orders['frete_imposto'], errors='coerce')
-        _icms_n = pd.to_numeric(df_orders['dif_icms'],      errors='coerce')
-        df_orders['preco_real'] = (_vf + _fi_n + _icms_n).where(_has_vf, other=None)
+        _icms_n = pd.to_numeric(df_orders['dif_icms'], errors='coerce')
+        df_orders['preco_real'] = (_vf + _icms_n).where(_has_both, other=None)
 
         _sel_id = st.session_state.get('detail_order_id')
         df_orders['detalhar'] = df_orders['id'].apply(lambda x: x == _sel_id if _sel_id is not None else False)
 
+        _pr  = pd.to_numeric(df_orders['preco_real'],  errors='coerce')
+        _iv  = pd.to_numeric(df_orders['items_value'], errors='coerce')
+        df_orders['pct_custo'] = ((_pr - _iv) / _iv * 100).where(_pr.notna() & _iv.notna() & (_iv != 0), other=None)
+
         df_display = df_orders.drop(columns=[
             'franchise_tax', 'store_id', 'platform_order_id',
             'product_invoice_doc', 'service_invoice_doc',
-            'unmapped_items', 'platform_status', 'total',
+            'unmapped_items', 'platform_status', 'total', 'loaded_at',
         ], errors='ignore').rename(columns={
             'vhsys':                'Pedido',
             'status_desc':          'Status',
@@ -324,15 +353,15 @@ with tab_orders:
             'dif_icms':             'Dif. ICMS (R$)',
             'frete_imposto':        'Frete + Imposto',
             'preco_real':           'Preço Real',
+            'pct_custo':            '% Custo',
             'alerta':               'Alerta',
-            'loaded_at':            'Importado em',
         })
 
         ordered_cols = [
             'detalhar', 'Pedido', 'Status', 'Data do Pedido',
             'Itens', 'Qtd Total', 'Valor Produtos (R$)',
             'NF Produtos (R$)', 'NF Serviço (R$)', 'Valor Faturado (R$)',
-            'Frete + Imposto', 'Dif. ICMS (R$)', 'Preço Real', 'Alerta', 'Importado em', 'id',
+            'Frete + Imposto', 'Dif. ICMS (R$)', 'Preço Real', '% Custo', 'Alerta', 'id',
         ]
         df_display = df_display[[c for c in ordered_cols if c in df_display.columns]]
 
@@ -347,15 +376,15 @@ with tab_orders:
                 'Data do Pedido':   st.column_config.DatetimeColumn("Data do Pedido", disabled=True, format="DD/MM/YYYY"),
                 'Itens':            st.column_config.NumberColumn("Itens", disabled=True),
                 'Qtd Total':        st.column_config.NumberColumn("Qtd Total", disabled=True),
-                'Dif. ICMS (R$)':   st.column_config.NumberColumn("Dif. ICMS (R$)", disabled=True, format="R$ %.2f"),
                 'Valor Produtos (R$)': st.column_config.NumberColumn("Valor Produtos (R$)", disabled=True, format="R$ %.2f"),
                 'NF Produtos (R$)': st.column_config.NumberColumn("NF Produtos (R$)", disabled=True, format="R$ %.2f"),
                 'NF Serviço (R$)':  st.column_config.NumberColumn("NF Serviço (R$)", disabled=True, format="R$ %.2f"),
                 'Valor Faturado (R$)': st.column_config.NumberColumn("Valor Faturado (R$)", disabled=True, format="R$ %.2f"),
-                'Frete + Imposto':  st.column_config.NumberColumn("Frete + Imposto", disabled=True, format="R$ %.2f"),
-                'Preço Real':       st.column_config.NumberColumn("Preço Real",      disabled=True, format="R$ %.2f"),
+                'Frete + Imposto':  st.column_config.NumberColumn("Frete + Imposto",  disabled=True, format="R$ %.2f"),
+                'Dif. ICMS (R$)':   st.column_config.NumberColumn("Dif. ICMS (R$)",   disabled=True, format="R$ %.2f"),
+                'Preço Real':       st.column_config.NumberColumn("Preço Real",        disabled=True, format="R$ %.2f"),
+                '% Custo':          st.column_config.NumberColumn("% Custo",           disabled=True, format="%.1f%%"),
                 'Alerta':           st.column_config.TextColumn("Alerta", disabled=True),
-                'Importado em':     st.column_config.DatetimeColumn("Importado em", disabled=True, format="DD/MM/YYYY"),
             },
             hide_index=True,
             use_container_width=True,
@@ -395,23 +424,37 @@ with tab_orders:
                     _item_price = pd.to_numeric(df_items['price_unit'], errors='coerce')
                     _item_dt    = pd.to_datetime(df_items['created_at'], errors='coerce')
 
-                    # dif_icms por unidade
-                    _item_factor = _item_dt.ge(pd.Timestamp('2025-06-15')).map({True: 0.85 * 0.06, False: 0.06})
-                    df_items['dif_icms'] = (_item_price * _item_factor).where(_item_price.notna(), other=None)
+                    # calcula somente quando o pedido tem ambas as NFs
+                    _ord_pnf = pd.to_numeric(checked.iloc[0].get('NF Produtos (R$)'), errors='coerce')
+                    _ord_snf = pd.to_numeric(checked.iloc[0].get('NF Serviço (R$)'),  errors='coerce')
+                    _ord_iv  = pd.to_numeric(checked.iloc[0].get('Valor Produtos (R$)'), errors='coerce')
+                    _item_has_both = pd.notna(_ord_pnf) and pd.notna(_ord_snf)
 
-                    # frete + imposto por unidade
-                    _ord_vf = pd.to_numeric(checked.iloc[0].get('Valor Faturado (R$)'), errors='coerce')
-                    _ord_iv = pd.to_numeric(checked.iloc[0].get('Valor Produtos (R$)'), errors='coerce')
-                    if pd.notna(_ord_vf) and pd.notna(_ord_iv) and _ord_iv != 0:
-                        _ratio = (_ord_vf - _ord_iv) / _ord_iv
-                        df_items['frete_imposto'] = (_item_price * _ratio).where(_item_price.notna(), other=None)
+                    if _item_has_both:
+                        _ord_vf = _ord_pnf + _ord_snf
+                        df_items['dif_icms'] = (_item_price * (0.85 * 0.06)).where(_item_price.notna(), other=None)
+                        if pd.notna(_ord_iv) and _ord_iv != 0:
+                            _ratio = (_ord_vf - _ord_iv) / _ord_iv
+                            df_items['frete_imposto'] = (_item_price * _ratio).where(_item_price.notna(), other=None)
+                        else:
+                            df_items['frete_imposto'] = None
                     else:
-                        df_items['frete_imposto'] = None
+                        df_items['dif_icms']      = None
+                        df_items['frete_imposto']  = None
 
                     # preço real por unidade
                     _fi  = pd.to_numeric(df_items['frete_imposto'], errors='coerce').fillna(0)
                     _icms = pd.to_numeric(df_items['dif_icms'],     errors='coerce').fillna(0)
-                    df_items['preco_real'] = (_item_price + _fi + _icms).where(_item_price.notna(), other=None)
+                    if _item_has_both:
+                        df_items['preco_real'] = (_item_price + _fi + _icms).where(_item_price.notna(), other=None)
+                    else:
+                        df_items['preco_real'] = None
+
+                    _pr_item = pd.to_numeric(df_items['preco_real'],  errors='coerce')
+                    _pu_item = pd.to_numeric(df_items['price_unit'],  errors='coerce')
+                    df_items['pct_custo'] = ((_pr_item - _pu_item) / _pu_item * 100).where(
+                        _pr_item.notna() & _pu_item.notna() & (_pu_item != 0), other=None
+                    )
 
                     _fmt = "R$ %.2f"
                     df_renamed = df_items.rename(columns={
@@ -422,12 +465,13 @@ with tab_orders:
                         'dif_icms':              'Dif. ICMS (R$)',
                         'frete_imposto':         'Frete + Imposto',
                         'preco_real':            'Preço Real',
+                        'pct_custo':             '% Custo',
                     }).drop(columns=['id', 'order_id', 'local_product_id', 'local_product_desc',
                                      'external_product_id', 'created_at', 'mapeado'], errors='ignore')
 
                     _cols = [c for c in [
                         'Produto Plataforma', 'Categoria', 'Qtd',
-                        'Preço Unit.', 'Frete + Imposto', 'Dif. ICMS (R$)', 'Preço Real',
+                        'Preço Unit.', 'Frete + Imposto', 'Dif. ICMS (R$)', 'Preço Real', '% Custo',
                     ] if c in df_renamed.columns]
 
                     st.dataframe(
@@ -438,6 +482,7 @@ with tab_orders:
                             'Frete + Imposto':st.column_config.NumberColumn("Frete + Imposto",format=_fmt),
                             'Dif. ICMS (R$)': st.column_config.NumberColumn("Dif. ICMS (R$)",format=_fmt),
                             'Preço Real':     st.column_config.NumberColumn("Preço Real",     format=_fmt),
+                            '% Custo':        st.column_config.NumberColumn("% Custo",        format="%.1f%%"),
                         },
                         use_container_width=True,
                         hide_index=True,
@@ -490,7 +535,7 @@ with tab_avg:
                 _vf    = pd.to_numeric(df_avg['valor_faturado'],    errors='coerce')
                 _dt    = pd.to_datetime(df_avg['created_at'],       errors='coerce')
 
-                _factor = _dt.ge(pd.Timestamp('2025-06-15')).map({True: 0.85 * 0.06, False: 0.06})
+                _factor = 0.85 * 0.06
                 _ratio  = ((_vf - _oiv) / _oiv).where(_oiv != 0, other=0)
 
                 df_avg['_qty_n']          = _qty
@@ -498,61 +543,91 @@ with tab_avg:
                 df_avg['valor_real_item'] = _qty * df_avg['preco_real_unit']
                 df_avg['valor_unit_item'] = _qty * _price
 
-                result = df_avg.groupby('product_desc').agg(
-                    Categoria          =('external_category', 'first'),
-                    qtd_total          =('_qty_n',            'sum'),
-                    soma_valor_unit    =('valor_unit_item',   'sum'),
-                    soma_valor_real    =('valor_real_item',   'sum'),
+                result = df_avg.groupby(['product_desc', 'external_category', 'type_of_load']).agg(
+                    qtd_total       =('_qty_n',          'sum'),
+                    soma_valor_unit =('valor_unit_item', 'sum'),
+                    soma_valor_real =('valor_real_item', 'sum'),
                 ).reset_index()
 
                 result['Preço Unit. Médio'] = result['soma_valor_unit'] / result['qtd_total']
                 result['Preço Real Médio']  = result['soma_valor_real'] / result['qtd_total']
                 result['Dif. por Caixa']    = result['Preço Real Médio'] - result['Preço Unit. Médio']
+                result['% Custo']           = (result['Preço Real Médio'] - result['Preço Unit. Médio']) / result['Preço Unit. Médio'].replace(0, None) * 100
 
                 result = result.rename(columns={
-                    'product_desc': 'Produto',
-                    'qtd_total':    'Qtd Total',
+                    'product_desc':       'Produto',
+                    'external_category':  'Categoria',
+                    'type_of_load':       '_tipo_raw',
+                    'qtd_total':          'Qtd Total',
                 }).drop(columns=['soma_valor_unit', 'soma_valor_real'])
 
-                result = result.sort_values('Produto')
+                result['Tipo'] = result['_tipo_raw'].map({0: 'Gelado', 1: 'Seco'}).fillna('Desconhecido')
+                result = result.drop(columns=['_tipo_raw']).sort_values('Produto')
 
-                _fmt = "R$ %.2f"
-                st.dataframe(
-                    result[['Produto', 'Categoria', 'Qtd Total',
-                             'Preço Unit. Médio', 'Dif. por Caixa', 'Preço Real Médio']],
-                    column_config={
-                        'Qtd Total':        st.column_config.NumberColumn("Qtd Total",        format="%.0f"),
-                        'Preço Unit. Médio':st.column_config.NumberColumn("Preço Unit. Médio",format=_fmt),
-                        'Dif. por Caixa':   st.column_config.NumberColumn("Dif. por Caixa",   format=_fmt),
-                        'Preço Real Médio': st.column_config.NumberColumn("Preço Real Médio", format=_fmt),
-                    },
-                    use_container_width=True,
-                    hide_index=True,
-                )
+                st.session_state['avg_result'] = result
 
-                st.divider()
-                st.subheader("Médias por Categoria")
+    if 'avg_result' in st.session_state:
+        result = st.session_state['avg_result']
 
-                cat_totals = result.groupby('Categoria').apply(
-                    lambda g: pd.Series({
-                        'Qtd Total':         g['Qtd Total'].sum(),
-                        'Preço Unit. Médio': (g['Preço Unit. Médio'] * g['Qtd Total']).sum() / g['Qtd Total'].sum(),
-                        'Preço Real Médio':  (g['Preço Real Médio']  * g['Qtd Total']).sum() / g['Qtd Total'].sum(),
-                    })
-                ).reset_index()
-                cat_totals['Dif. por Caixa'] = cat_totals['Preço Real Médio'] - cat_totals['Preço Unit. Médio']
+        _fmt = "R$ %.2f"
 
-                st.dataframe(
-                    cat_totals[['Categoria', 'Qtd Total', 'Preço Unit. Médio', 'Dif. por Caixa', 'Preço Real Médio']],
-                    column_config={
-                        'Qtd Total':         st.column_config.NumberColumn("Qtd Total",         format="%.0f"),
-                        'Preço Unit. Médio': st.column_config.NumberColumn("Preço Unit. Médio", format=_fmt),
-                        'Dif. por Caixa':    st.column_config.NumberColumn("Dif. por Caixa",    format=_fmt),
-                        'Preço Real Médio':  st.column_config.NumberColumn("Preço Real Médio",  format=_fmt),
-                    },
-                    use_container_width=True,
-                    hide_index=True,
-                )
+        # Filtros
+        fa1, fa2, fa3 = st.columns([1, 2, 3])
+        with fa1:
+            _tipo_opts_avg = ['Todos'] + sorted(result['Tipo'].dropna().unique().tolist())
+            avg_tipo = st.selectbox("Tipo", _tipo_opts_avg, key="avg_tipo")
+        with fa2:
+            _base_cat = result if avg_tipo == 'Todos' else result[result['Tipo'] == avg_tipo]
+            _cat_opts = ['Todas'] + sorted(_base_cat['Categoria'].dropna().unique().tolist())
+            avg_cat = st.selectbox("Categoria", _cat_opts, key="avg_cat")
+        with fa3:
+            avg_busca = st.text_input("Buscar produto", key="avg_busca")
+
+        df_show = result.copy()
+        if avg_tipo != 'Todos':
+            df_show = df_show[df_show['Tipo'] == avg_tipo]
+        if avg_cat != 'Todas':
+            df_show = df_show[df_show['Categoria'] == avg_cat]
+        if avg_busca.strip():
+            df_show = df_show[df_show['Produto'].str.contains(avg_busca.strip(), case=False, na=False)]
+
+        st.dataframe(
+            df_show[['Produto', 'Tipo', 'Categoria', 'Qtd Total',
+                     'Preço Unit. Médio', 'Dif. por Caixa', 'Preço Real Médio', '% Custo']],
+            column_config={
+                'Qtd Total':        st.column_config.NumberColumn("Qtd Total",        format="%.0f"),
+                'Preço Unit. Médio':st.column_config.NumberColumn("Preço Unit. Médio",format=_fmt),
+                'Dif. por Caixa':   st.column_config.NumberColumn("Dif. por Caixa",   format=_fmt),
+                'Preço Real Médio': st.column_config.NumberColumn("Preço Real Médio", format=_fmt),
+                '% Custo':          st.column_config.NumberColumn("% Custo",          format="%.1f%%"),
+            },
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.divider()
+        st.subheader("Médias por Categoria")
+
+        cat_totals = df_show.groupby('Categoria').apply(
+            lambda g: pd.Series({
+                'Qtd Total':         g['Qtd Total'].sum(),
+                'Preço Unit. Médio': (g['Preço Unit. Médio'] * g['Qtd Total']).sum() / g['Qtd Total'].sum(),
+                'Preço Real Médio':  (g['Preço Real Médio']  * g['Qtd Total']).sum() / g['Qtd Total'].sum(),
+            })
+        ).reset_index()
+        cat_totals['Dif. por Caixa'] = cat_totals['Preço Real Médio'] - cat_totals['Preço Unit. Médio']
+
+        st.dataframe(
+            cat_totals[['Categoria', 'Qtd Total', 'Preço Unit. Médio', 'Dif. por Caixa', 'Preço Real Médio']],
+            column_config={
+                'Qtd Total':         st.column_config.NumberColumn("Qtd Total",         format="%.0f"),
+                'Preço Unit. Médio': st.column_config.NumberColumn("Preço Unit. Médio", format=_fmt),
+                'Dif. por Caixa':    st.column_config.NumberColumn("Dif. por Caixa",    format=_fmt),
+                'Preço Real Médio':  st.column_config.NumberColumn("Preço Real Médio",  format=_fmt),
+            },
+            use_container_width=True,
+            hide_index=True,
+        )
 
 
 # ── TAB 5: Análise de Itens ──────────────────────────────────────────────────
@@ -594,13 +669,15 @@ with tab_freq:
                 total_pedidos = df_freq['num_pedidos'].max()
                 df_freq['% pedidos'] = (df_freq['num_pedidos'] / total_pedidos * 100).round(1)
 
+                df_freq['Tipo'] = df_freq['type_of_load'].map({0: 'Gelado', 1: 'Seco'}).fillna('Desconhecido')
+
                 df_freq = df_freq.rename(columns={
                     'product_desc':      'Produto',
                     'external_category': 'Categoria',
                     'num_pedidos':       'Nº Pedidos',
                     'qty_total':         'Qtd Total',
                     'qty_media':         'Qtd Média/Pedido',
-                })
+                }).drop(columns=['type_of_load'])
 
                 st.session_state['freq_df']            = df_freq
                 st.session_state['freq_total_pedidos'] = int(total_pedidos)
@@ -609,21 +686,26 @@ with tab_freq:
         df_freq = st.session_state['freq_df']
         total_pedidos = st.session_state['freq_total_pedidos']
 
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
         with c1:
+            _tipo_opts_freq = ['Todos'] + sorted(df_freq['Tipo'].dropna().unique().tolist())
+            tipo_filter = st.selectbox("Tipo", _tipo_opts_freq, key="freq_tipo")
+        with c2:
             cats = ['Todas'] + sorted(df_freq['Categoria'].dropna().unique().tolist())
             cat_filter = st.selectbox("Categoria", cats, key="freq_cat")
-        with c2:
+        with c3:
             busca_prod = st.text_input("Buscar produto", key="freq_busca")
 
         df_show = df_freq.copy()
+        if tipo_filter != 'Todos':
+            df_show = df_show[df_show['Tipo'] == tipo_filter]
         if cat_filter != 'Todas':
             df_show = df_show[df_show['Categoria'] == cat_filter]
         if busca_prod.strip():
             df_show = df_show[df_show['Produto'].str.contains(busca_prod.strip(), case=False, na=False)]
 
         st.dataframe(
-            df_show[['Produto', 'Categoria', 'Nº Pedidos', '% pedidos', 'Qtd Total', 'Qtd Média/Pedido']],
+            df_show[['Produto', 'Tipo', 'Categoria', 'Nº Pedidos', '% pedidos', 'Qtd Total', 'Qtd Média/Pedido']],
             column_config={
                 'Nº Pedidos':       st.column_config.NumberColumn("Nº Pedidos",       format="%d"),
                 '% pedidos':        st.column_config.NumberColumn("% dos pedidos",    format="%.1f%%"),

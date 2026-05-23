@@ -60,6 +60,7 @@ def save_supplier_orders(cursor, orders: List[Dict],
             'pid_doc': product_invoice_doc,
             'siv':     service_invoice_value,
             'sid_doc': service_invoice_doc,
+            'tol':     order.get("type_of_load"),
         }
 
         if update_existing:
@@ -67,10 +68,10 @@ def save_supplier_orders(cursor, orders: List[Dict],
                 INSERT INTO SUPPLIER_ORDER (
                     platform_order_id, store_id, platform_status, total, franchise_tax,
                     vhsys, product_invoice_value, product_invoice_doc,
-                    service_invoice_value, service_invoice_doc
+                    service_invoice_value, service_invoice_doc, type_of_load
                 ) VALUES (
                     %(pid)s, %(store)s, %(pstatus)s, %(total)s, %(tax)s,
-                    %(vhsys)s, %(piv)s, %(pid_doc)s, %(siv)s, %(sid_doc)s
+                    %(vhsys)s, %(piv)s, %(pid_doc)s, %(siv)s, %(sid_doc)s, %(tol)s
                 )
                 ON CONFLICT (platform_order_id) DO UPDATE SET
                     platform_status       = EXCLUDED.platform_status,
@@ -79,7 +80,8 @@ def save_supplier_orders(cursor, orders: List[Dict],
                     product_invoice_value = COALESCE(EXCLUDED.product_invoice_value, SUPPLIER_ORDER.product_invoice_value),
                     product_invoice_doc   = COALESCE(EXCLUDED.product_invoice_doc,   SUPPLIER_ORDER.product_invoice_doc),
                     service_invoice_value = COALESCE(EXCLUDED.service_invoice_value, SUPPLIER_ORDER.service_invoice_value),
-                    service_invoice_doc   = COALESCE(EXCLUDED.service_invoice_doc,   SUPPLIER_ORDER.service_invoice_doc)
+                    service_invoice_doc   = COALESCE(EXCLUDED.service_invoice_doc,   SUPPLIER_ORDER.service_invoice_doc),
+                    type_of_load          = COALESCE(EXCLUDED.type_of_load, SUPPLIER_ORDER.type_of_load)
                 RETURNING id, (xmax = 0) AS is_new
             """, params)
         else:
@@ -87,10 +89,10 @@ def save_supplier_orders(cursor, orders: List[Dict],
                 INSERT INTO SUPPLIER_ORDER (
                     platform_order_id, store_id, platform_status, total, franchise_tax,
                     vhsys, product_invoice_value, product_invoice_doc,
-                    service_invoice_value, service_invoice_doc
+                    service_invoice_value, service_invoice_doc, type_of_load
                 ) VALUES (
                     %(pid)s, %(store)s, %(pstatus)s, %(total)s, %(tax)s,
-                    %(vhsys)s, %(piv)s, %(pid_doc)s, %(siv)s, %(sid_doc)s
+                    %(vhsys)s, %(piv)s, %(pid_doc)s, %(siv)s, %(sid_doc)s, %(tol)s
                 )
                 ON CONFLICT (platform_order_id) DO NOTHING
                 RETURNING id
